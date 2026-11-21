@@ -4,9 +4,11 @@ Small plugins for OpenCode 2.x, written against the version bundled in OpenChamb
 
 | Plugin | What it does | Status |
 |---|---|---|
-| [session-archive](plugins/session-archive/) | Lets an agent archive or restore a session, and wrap a session up by saving a written summary of the work before archiving. | 0.1.0, not yet run inside OpenCode |
+| [session-archive](plugins/session-archive/) | Lets an agent archive or restore a session, and wrap a session up by saving a written summary of the work before archiving. | 0.2.0. Loads and registers its command in OpenChamber 2.7.3; tool calls by an agent not yet tested. |
 
 ## Install
+
+An AI agent installing this for a user should follow [INSTALL-FOR-AGENTS.md](INSTALL-FOR-AGENTS.md). Manual steps:
 
 Each plugin is a self-contained folder with no dependencies and no build step.
 

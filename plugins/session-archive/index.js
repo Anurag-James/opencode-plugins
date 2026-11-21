@@ -1,33 +1,58 @@
 // OpenCode (2.x) server plugin: session_archive and session_wrap_up tools,
 // plus a /wrap-up command. No dependencies; everything comes from `ctx`.
-import { appendFile, mkdir, writeFile } from "node:fs/promises"
+import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises"
+import os from "node:os"
 import path from "node:path"
 
 const MIN_SUMMARY_CHARS = 200
 const SUMMARY_DIR = path.join(".opencode", "session-summaries")
+const OVERRIDE_MAX_CHARS = 20000
+
+// Global OpenCode config directory: $XDG_CONFIG_HOME/opencode, else ~/.config/opencode.
+const globalConfigDir = () => path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "opencode")
 
 const WRAP_UP_DESCRIPTION = [
-  "Wrap up a session: save a written summary of all the work done, then archive the session.",
-  "You write the summary yourself and pass it in `summary` (markdown). The tool saves it to",
-  ".opencode/session-summaries/ in the session's working directory and archives only if the save worked.",
-  "The summary must cover the WHOLE session, not only the latest turn. If your context was compacted,",
-  "re-read the session's earlier messages first, using whatever message-reading means you have",
-  "(in OpenChamber: the openchamber tool's session.messages action with all set to true).",
-  "Contents, in this order: (1) objective of the session; (2) what was done, in order; (3) decisions made and why;",
+  "Wrap up a session: record how it went, then archive the session.",
+  "If the environment already defines a session-end, wrap-up, handoff or ledger-closing procedure (in its skills or project instructions),",
+  "that procedure takes precedence: carry it out first, and do not write a second, different summary.",
+  "Pass either `summary` (markdown you write) or `recordPath` (a file the existing procedure already wrote; relative paths resolve against the session directory), or both.",
+  "With `recordPath` the file is not copied: the tool saves a short pointer to it.",
+  "The tool saves its file under .opencode/session-summaries/ in the session's working directory and archives only if that save worked.",
+  "A `summary` or record shorter than " + MIN_SUMMARY_CHARS + " characters is rejected and nothing is archived.",
+  "A summary must cover the WHOLE session, not only the latest turn; if your context was compacted, re-read the session's earlier messages first, using whatever message-reading means you have (in OpenChamber: the openchamber tool's session.messages action with all set to true).",
+  "When no existing procedure applies, the default contents are, in this order: (1) objective of the session; (2) what was done, in order; (3) decisions made and why;",
   "(4) files created or changed, with paths; (5) commands or checks run and their results;",
   "(6) what is unfinished or unverified; (7) suggested next steps.",
-  `A summary shorter than ${MIN_SUMMARY_CHARS} characters is rejected and nothing is archived.`,
-  "Set archive to false to save the summary without archiving. sessionId defaults to the current session.",
+  "Set archive to false to save without archiving. sessionId defaults to the current session.",
 ].join(" ")
 
 const WRAP_UP_PROMPT = [
   "Wrap up this session.",
-  "1. Review the WHOLE session, not just the latest turn. If your context was compacted, re-read earlier messages first.",
-  "2. Write a markdown summary with these sections, in order: Objective; What was done (in order); Decisions and why;",
+  "1. Check whether this environment already defines a wrap-up, session-end, handoff or ledger-closing procedure (in its skills or project instruction files).",
+  "If it does, carry that out first and use its result rather than writing a second, different summary; then skip to step 4, passing the file it wrote as recordPath (or its text as summary).",
+  "2. Otherwise review the WHOLE session, not just the latest turn. If your context was compacted, re-read earlier messages first.",
+  "3. Write a markdown summary with these sections, in order: Objective; What was done (in order); Decisions and why;",
   "Files created or changed (paths); Commands or checks run and results; Unfinished or unverified; Suggested next steps.",
-  "3. Call the session_wrap_up tool with that summary. It saves the summary to the project folder and archives the session.",
-  "4. Tell me the saved file path and the archive state.",
+  "4. Call the session_wrap_up tool with the summary or recordPath. It saves a record to the project folder and archives the session.",
+  "5. Tell me the saved file path and the archive state.",
 ].join("\n")
+
+const OVERRIDE_CLOSING =
+  "Finish by calling the session_wrap_up tool: pass `summary` with the summary you wrote, or `recordPath` with the file your procedure already wrote. Then report the saved file path and the archive state."
+
+// Reads wrap-up.md: project (<dir>/.opencode/wrap-up.md) first, then global. Empty file = absent.
+const readOverride = async (directory) => {
+  const candidates = [directory && path.join(directory, ".opencode", "wrap-up.md"), path.join(globalConfigDir(), "wrap-up.md")]
+  for (const file of candidates.filter(Boolean)) {
+    try {
+      const text = (await readFile(file, "utf8")).slice(0, OVERRIDE_MAX_CHARS).trim()
+      if (text) return text
+    } catch {
+      // missing or unreadable: try the next one
+    }
+  }
+  return undefined
+}
 
 // Models sometimes send booleans as strings.
 const toBool = (value, fallback) => (value === undefined || value === null ? fallback : value === true || value === "true")
@@ -82,13 +107,13 @@ const archiveTool = (ctx) => ({
   },
 })
 
-const writeSummary = async (directory, sessionID, title, summary) => {
+const writeSummary = async (directory, sessionID, title, body) => {
   const now = new Date()
   const stamp = now.toISOString()
   const folder = path.join(directory, SUMMARY_DIR)
   const file = path.join(folder, `${stamp.slice(0, 10)}-${sessionID}.md`)
   await mkdir(folder, { recursive: true })
-  const section = `## Wrap-up ${stamp}\n\n${summary.trim()}\n`
+  const section = `## Wrap-up ${stamp}\n\n${body.trim()}\n`
   const header = [
     `# Session summary`,
     "",
@@ -115,20 +140,30 @@ const wrapUpTool = (ctx) => ({
   input: {
     type: "object",
     properties: {
-      summary: { type: "string", description: "Markdown summary of the whole session, in the order given in the tool description." },
-      archive: { type: "boolean", description: "Archive the session after saving the summary. Default true." },
+      summary: { type: "string", description: "Markdown summary of the whole session. Give this or recordPath (or both)." },
+      recordPath: {
+        type: "string",
+        description: "Path to a file an existing session-end procedure already wrote; relative paths resolve against the session directory. Not copied: only a pointer is saved.",
+      },
+      archive: { type: "boolean", description: "Archive the session after saving. Default true." },
       sessionId: { type: "string", description: "Session id. Defaults to the current session." },
     },
-    required: ["summary"],
     additionalProperties: false,
   },
   async execute(input, context) {
-    const summary = typeof input?.summary === "string" ? input.summary : ""
-    if (summary.trim().length < MIN_SUMMARY_CHARS) {
+    const summary = typeof input?.summary === "string" ? input.summary.trim() : ""
+    const recordArg = typeof input?.recordPath === "string" ? input.recordPath.trim() : ""
+    if (!summary && !recordArg) {
+      return reply(
+        "Rejected: give `summary` (markdown covering the whole session) or `recordPath` (a file your session-end procedure already wrote). Nothing was saved or archived.",
+        false,
+      )
+    }
+    if (summary && summary.length < MIN_SUMMARY_CHARS) {
       return reply(
         `Rejected: summary must be at least ${MIN_SUMMARY_CHARS} characters. Write the full summary covering the whole session ` +
           "(objective; what was done in order; decisions and why; files changed; commands/checks and results; unfinished or unverified; next steps) " +
-          "and call again. Nothing was saved or archived.",
+          "or point recordPath at the record your procedure wrote, and call again. Nothing was saved or archived.",
         false,
       )
     }
@@ -139,21 +174,36 @@ const wrapUpTool = (ctx) => ({
     const directory = found.info?.location?.directory ?? ctx.location?.directory
     if (!directory) return reply(`Cannot tell the working directory of session ${sessionID}. Nothing was saved or archived.`, false, { sessionID })
 
+    let pointer
+    if (recordArg) {
+      const record = path.resolve(directory, recordArg)
+      let problem
+      try {
+        if (!(await stat(record)).isFile()) problem = "is not a regular file"
+        else if ((await readFile(record, "utf8")).trim().length < MIN_SUMMARY_CHARS) problem = `has fewer than ${MIN_SUMMARY_CHARS} characters`
+      } catch (error) {
+        problem = error?.code === "ENOENT" ? "does not exist" : `cannot be read (${describeError(error)})`
+      }
+      if (problem) return reply(`Rejected: recordPath ${record} ${problem}. Nothing was saved or archived.`, false, { sessionID })
+      const relative = path.relative(directory, record)
+      pointer = `Record: ${relative && !relative.startsWith("..") && !path.isAbsolute(relative) ? relative : record}`
+    }
+
     let file
     try {
-      file = await writeSummary(directory, sessionID, found.info?.title, summary)
+      file = await writeSummary(directory, sessionID, found.info?.title, [summary, pointer].filter(Boolean).join("\n\n"))
     } catch (error) {
       return reply(`Could not save the summary (${describeError(error)}). The session was not archived.`, false, { sessionID })
     }
 
     if (!toBool(input?.archive, true)) {
-      return reply(`Summary saved to ${file}. Session ${sessionID} not archived (archive=false); state: ${stateWord(isArchived(found.info))}.`, true, { sessionID, file })
+      return reply(`Saved to ${file}. Session ${sessionID} not archived (archive=false); state: ${stateWord(isArchived(found.info))}.`, true, { sessionID, file })
     }
     try {
       const now = await applyArchived(ctx, sessionID, true)
-      return reply(`Summary saved to ${file}. Session ${sessionID} is now ${stateWord(now)}.`, now, { sessionID, file, archived: now })
+      return reply(`Saved to ${file}. Session ${sessionID} is now ${stateWord(now)}.`, now, { sessionID, file, archived: now })
     } catch (error) {
-      return reply(`Summary saved to ${file}, but archiving failed: ${describeError(error)}`, false, { sessionID, file })
+      return reply(`Saved to ${file}, but archiving failed: ${describeError(error)}`, false, { sessionID, file })
     }
   },
 })
@@ -170,12 +220,15 @@ export default {
         commands.add({
           name: "wrap-up",
           description: "write a summary of the whole session to the project folder, then archive it",
-          execute: (command) => {
+          execute: async (command) => {
             const extra = command.prompt?.text?.trim()
+            const found = await getSession(ctx, command.sessionID)
+            const override = await readOverride(found.info?.location?.directory ?? ctx.location?.directory)
+            const procedure = override ? `${override}\n\n${OVERRIDE_CLOSING}` : WRAP_UP_PROMPT
             return ctx.session.prompt({
               ...command.prompt,
               sessionID: command.sessionID,
-              text: extra ? `${WRAP_UP_PROMPT}\n\nExtra instructions: ${extra}` : WRAP_UP_PROMPT,
+              text: extra ? `${procedure}\n\nExtra instructions: ${extra}` : procedure,
               delivery: command.delivery,
             })
           },

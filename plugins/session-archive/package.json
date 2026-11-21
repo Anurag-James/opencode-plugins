@@ -1,6 +1,6 @@
 {
   "name": "opencode-session-archive",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenCode plugin: tools to archive/unarchive a session and to wrap a session up with a written summary.",
   "type": "module",
   "license": "MIT",
